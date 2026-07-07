@@ -89,8 +89,7 @@ NS_VIS_RADIUS = 0.010          # Visual display radius [normalized screen coords
 # --- Orbital Mechanics ---
 INIT_SEPARATION = 0.22         # Initial orbital separation [normalized screen coords]
                                 # Tuned for ~5-8 second inspiral at 1x time speed.
-GW_DECAY_COEFF = 1.8e-5        # Increased for faster visual evolution
-                                # SIMPLIFIED Peters (1964) formula:  da/dt = -C / a^3
+GW_DECAY_COEFF = 5.5e-4        # Tuned so stars merge slightly faster (~5 seconds) before collision
 MERGE_DISTANCE = 0.024         # Merger trigger distance [normalized coords]
 DT_BASE = 2.0e-3               # Base simulation timestep [sim time units]
 
@@ -1082,13 +1081,16 @@ def main():
                 if phase == 0:
                     # ======= INSPIRAL =======
                     # Peters formula orbital decay: da/dt = -C / a^3
-                    # We add a small extra chirp factor near contact for faster acceleration
+                    # Chirp acceleration factor (orbital frequency chirp)
+                    # Relativistic correction factor to speed up final merger phases
                     chirp_acc = 1.0 + max(0.0, (INIT_SEPARATION - separation) / INIT_SEPARATION) * 1.5
-                    separation -= GW_DECAY_COEFF * g_mult * chirp_acc / (separation**3 + 1e-18) * time_spd / substeps
+                    separation -= GW_DECAY_COEFF * g_mult * chirp_acc / (separation**3 + 1e-18) * sub_dt
                     separation = max(separation, 0.001)
 
                     # Kepler's third law: omega^2 = G * M_total / a^3
-                    omega = math.sqrt(G * m_total * g_mult / (separation**3 + 1e-18))
+                    # We multiply the visual omega by 55.0 so the stars rotate rapidly 
+                    # while the physical gravity remains stable for the particles!
+                    omega = math.sqrt(G * m_total * g_mult / (separation**3 + 1e-18)) * 55.0
                     theta += omega * sub_dt
 
                     s1x, s1y, s2x, s2y, s1vx, s1vy, s2vx, s2vy, _ = \
