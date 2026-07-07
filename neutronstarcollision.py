@@ -88,19 +88,16 @@ NS_VIS_RADIUS = 0.010          # Visual display radius [normalized screen coords
 
 # --- Orbital Mechanics ---
 INIT_SEPARATION = 0.22         # Initial orbital separation [normalized screen coords]
-                                # Tuned for ~18-25 second inspiral at 1x time speed.
-                                # (Real inspiral: millions of years, final seconds shown here.)
-GW_DECAY_COEFF = 6.5e-6        # Gravitational wave orbital decay coefficient [sim units]
+                                # Tuned for ~5-8 second inspiral at 1x time speed.
+GW_DECAY_COEFF = 1.8e-5        # Increased for faster visual evolution
                                 # SIMPLIFIED Peters (1964) formula:  da/dt = -C / a^3
-                                # Real formula: da/dt = -64/5 * G^3*m1*m2*(m1+m2) / (c^5 * a^3)
-                                # VIBECODED: The 1/a^3 dependence is physically correct
-                                # (orbit shrinks faster as stars approach), creating the
-                                # natural "chirp" acceleration. Constant C is tuned for
-                                # visual drama over ~20 seconds rather than eons.
 MERGE_DISTANCE = 0.024         # Merger trigger distance [normalized coords]
-                                # When orbital separation < this, collision initiates.
-DT_BASE = 1.5e-3               # Base simulation timestep [sim time units]
-                                # Courant-like stability condition for semi-implicit Euler.
+DT_BASE = 2.0e-3               # Base simulation timestep [sim time units]
+
+# --- Remnant Constants ---
+TOV_LIMIT = 2.15               # Tolman-Oppenheimer-Volkoff mass limit (sim units)
+                                # Below this -> Magnetar. Above this -> Black Hole.
+EH_RADIUS = 0.015              # Event horizon physical radius for Black Hole.
 
 # --- Explosion / Kilonova ---
 EXPLODE_SPEED = 0.10           # Maximum ejecta radial velocity [sim velocity]
@@ -155,13 +152,14 @@ S_BRIGHT = 2.2                 # Star glow base brightness multiplier
 # TAICHI FIELDS — All per-particle state, accessed from @ti.kernel functions.
 # =============================================================================
 
-pos   = ti.Vector.field(2, dtype=ti.f32, shape=MAX_P)   # Position [norm 0-1]
-vel   = ti.Vector.field(2, dtype=ti.f32, shape=MAX_P)   # Velocity [sim units]
-temp  = ti.field(dtype=ti.f32, shape=MAX_P)              # Temperature [0-1]
-age   = ti.field(dtype=ti.f32, shape=MAX_P)              # Age [sim time]
-alive = ti.field(dtype=ti.i32, shape=MAX_P)              # 1=active, 0=dead
-ptype = ti.field(dtype=ti.i32, shape=MAX_P)              # 0=disk1, 1=disk2, 2=ejecta,
-                                                          # 3=ambient, 4=jet
+pos     = ti.Vector.field(2, dtype=ti.f32, shape=MAX_P)   # Position [norm 0-1]
+vel     = ti.Vector.field(2, dtype=ti.f32, shape=MAX_P)   # Velocity [sim units]
+temp    = ti.field(dtype=ti.f32, shape=MAX_P)              # Temperature [0-1]
+age     = ti.field(dtype=ti.f32, shape=MAX_P)              # Age [sim time]
+alive   = ti.field(dtype=ti.i32, shape=MAX_P)              # 1=active, 0=dead
+ptype   = ti.field(dtype=ti.i32, shape=MAX_P)              # 0=disk1, 1=disk2, 2=ejecta,
+                                                            # 3=ambient, 4=jet
+element = ti.field(dtype=ti.i32, shape=MAX_P)              # 0=Fe/disk, 1=Pt, 2=Au, 3=U
 
 # Pixel buffer: additive rendering with image persistence for trails
 pixels = ti.Vector.field(3, dtype=ti.f32, shape=(WIDTH, HEIGHT))
@@ -264,6 +262,26 @@ def color_by_field(px: ti.f32, py: ti.f32) -> ti.Vector:
 
 
 @ti.func
+def color_by_element(i: ti.i32) -> ti.Vector:
+    """Color particles by synthesized r-process elements: Platinum (Pt), Gold (Au), Uranium (U)."""
+    col = ti.Vector([0.5, 0.5, 0.5])
+    el = element[i]
+    if el == 0:
+        # Fe/light elements (accretion disk, ISM): glowing blue-cyan
+        col = ti.Vector([0.1, 0.45, 0.75])
+    elif el == 1:
+        # Platinum (Pt): Silver/White-blue
+        col = ti.Vector([0.85, 0.90, 0.98])
+    elif el == 2:
+        # Gold (Au): Rich warm gold
+        col = ti.Vector([1.0, 0.78, 0.05])
+    elif el == 3:
+        # Uranium (U): Radioactive bright lime-green
+        col = ti.Vector([0.22, 0.95, 0.40])
+    return col
+
+
+@ti.func
 def get_particle_color(i: ti.i32, mode: ti.i32) -> ti.Vector:
     """Dispatch to the active color mapping mode."""
     col = ti.Vector([1.0, 1.0, 1.0])
@@ -273,8 +291,10 @@ def get_particle_color(i: ti.i32, mode: ti.i32) -> ti.Vector:
         col = color_by_velocity(vel[i][0], vel[i][1])
     elif mode == 2:
         col = color_by_age(age[i])
-    else:
+    elif mode == 3:
         col = color_by_field(pos[i][0], pos[i][1])
+    else:
+        col = color_by_element(i)
     return col
 
 
@@ -295,6 +315,7 @@ def init_particles(n: ti.i32,
     for i in range(n):
         alive[i] = 1
         age[i] = ti.random() * 60.0   # Stagger ages for visual variety
+        element[i] = 0
 
         r = ti.random()
         ang = ti.random() * 2.0 * PI
@@ -433,10 +454,12 @@ def step_binary(n: ti.i32,
 @ti.kernel
 def step_merged(n: ti.i32, cx: ti.f32, cy: ti.f32, mt: ti.f32,
                 dt: ti.f32, damp: ti.f32, g_mult: ti.f32,
-                mx: ti.f32, my: ti.f32, m_act: ti.i32):
+                mx: ti.f32, my: ti.f32, m_act: ti.i32,
+                is_black_hole: ti.i32):
     """
     Physics update post-merger: single central remnant gravity.
-    Remnant may be hypermassive NS or nascent black hole.
+    Remnant may be a rapidly spinning Magnetar or a collapsed Black Hole.
+    Black Hole absorbs particles crossing the Event Horizon and recycles them.
     """
     for i in range(n):
         if alive[i] == 0:
@@ -473,15 +496,23 @@ def step_merged(n: ti.i32, cx: ti.f32, cy: ti.f32, mt: ti.f32,
         age[i] += dt
         temp[i] = ti.max(temp[i] - COOL_RATE * dt * 120.0, 0.02)
 
-        if p[0] < -0.12 or p[0] > 1.12 or p[1] < -0.12 or p[1] > 1.12:
+        # Swallowed or out of bounds check
+        dist_rem = ti.sqrt(dx * dx + dy * dy + 1e-9)
+        off_screen = p[0] < -0.12 or p[0] > 1.12 or p[1] < -0.12 or p[1] > 1.12
+        swallowed = is_black_hole == 1 and dist_rem < EH_RADIUS
+
+        if off_screen or swallowed:
             ang2 = ti.random() * 2.0 * PI
-            rr   = 0.015 + ti.random() * 0.055
-            v_o  = ti.sqrt(G * mt * g_mult / (rr + SOFTENING)) * 0.65
+            # If swallowed by BH, recycle to the hot accretion disk. If off-screen, spawn near central remnant.
+            rr = 0.045 + ti.random() * 0.12 if swallowed else 0.015 + ti.random() * 0.055
+            v_o = ti.sqrt(G * mt * g_mult / (rr + SOFTENING)) * (0.85 if swallowed else 0.65)
             pos[i] = ti.Vector([cx + rr * ti.cos(ang2), cy + rr * ti.sin(ang2)])
             vel[i] = ti.Vector([-v_o * ti.sin(ang2), v_o * ti.cos(ang2)])
-            temp[i] = 0.20 + ti.random() * 0.25
-            age[i]  = 0.0
+            temp[i] = 0.28 + ti.random() * 0.32 if swallowed else 0.20 + ti.random() * 0.25
+            age[i] = 0.0
             ptype[i] = 2
+            if swallowed:
+                element[i] = 0  # Re-melted into light disk material
 
 
 @ti.kernel
@@ -511,6 +542,7 @@ def trigger_explosion(n: ti.i32, cx: ti.f32, cy: ti.f32,
             vel[i] = ti.Vector([jspd * ti.cos(jet_ang), jspd * ti.sin(jet_ang)])
             temp[i] = PEAK_TEMP          # Jets are ultrarelativistic-hot
             ptype[i] = 4                 # Jet particle
+            element[i] = 3 if (ti.random() < 0.4) else 1  # Uranium / Platinum synthesis
         else:
             # --- SPHERICAL KILONOVA EJECTA ---
             # Power-law speed distribution: dM/dv ~ v^(-1.5)
@@ -528,6 +560,14 @@ def trigger_explosion(n: ti.i32, cx: ti.f32, cy: ti.f32,
             temp[i] = PEAK_TEMP * ti.exp(-dist * 18.0)
             temp[i] = ti.max(temp[i], 0.25)
             ptype[i] = 2
+            
+            # Element distribution based on ejecta expansion speed
+            if spd_frac > 0.72:
+                element[i] = 1 # Platinum (outer fast dynamic ejecta)
+            elif spd_frac > 0.32:
+                element[i] = 2 # Gold (intermediate-speed main r-process ejecta)
+            else:
+                element[i] = 3 # Uranium (inner slow high-density actinide ejecta)
 
         age[i] = 0.0
 
@@ -654,17 +694,28 @@ def render_effects(cx: ti.f32, cy: ti.f32, sim_t: ti.f32,
                    shock_r: ti.f32, shock_a: ti.f32,
                    gw_amp: ti.f32, gw_wl: ti.f32,
                    show_gw: ti.i32, show_shock: ti.i32,
-                   flash_a: ti.f32):
+                   flash_a: ti.f32,
+                   is_black_hole: ti.i32, pulsar_angle: ti.f32,
+                   remnant_active: ti.i32, grb_a: ti.f32):
     """
-    Screen-space effects combined in one pixel-buffer pass:
+    Screen-space effects pass:
       1. Collision flash (brief white overlay)
-      2. Gravitational wave ripples (inspiral concentric rings)
-      3. Primary shockwave ring (blue-white, fast lanthanide-free ejecta)
-      4. Secondary shockwave ring (orange-gold, slow r-process ejecta)
-      5. Final tone mapping (clamp to [0,1])
+      2. Gamma-Ray Burst (collimated vertical jet beam of energy)
+      3. Gravitational wave ripples (inspiral concentric rings)
+      4. Shockwave rings (blue-white fast ejecta & gold-orange slow kilonova ejecta)
+      5. Black Hole Remnant (event horizon overlay + Einstein lensing ring)
+      6. Magnetar Remnant (bipolar rotating pulsar beams + poloidal dipole loops)
+      7. Tone mapping / clamping
     """
     aspect = float(WIDTH) / float(HEIGHT)
     for i, j in pixels:
+        fx = float(i) / float(WIDTH)
+        fy = float(j) / float(HEIGHT)
+        
+        # Aspect-corrected distance relative to center
+        ddx = (fx - cx) * aspect
+        ddy = fy - cy
+        dist = ti.sqrt(ddx * ddx + ddy * ddy + 1e-10)
 
         # ---- Collision flash ----
         if flash_a > 0.005:
@@ -672,12 +723,14 @@ def render_effects(cx: ti.f32, cy: ti.f32, sim_t: ti.f32,
             pixels[i, j][1] += flash_a * 0.97
             pixels[i, j][2] += flash_a * 1.00
 
-        fx = float(i) / float(WIDTH)
-        fy = float(j) / float(HEIGHT)
-        # Aspect-corrected distance for circular rings
-        ddx = (fx - cx) * aspect
-        ddy = fy - cy
-        dist = ti.sqrt(ddx * ddx + ddy * ddy + 1e-10)
+        # ---- Gamma-Ray Burst (Collimated Bipolar Jet Beam) ----
+        if grb_a > 0.005:
+            dx_c = ti.abs(fx - cx) * aspect
+            # Relativistic beam along vertical center (x = cx)
+            beam = grb_a * ti.exp(-dx_c * dx_c / 0.00016)
+            pixels[i, j][0] += beam * 0.70
+            pixels[i, j][1] += beam * 0.85
+            pixels[i, j][2] += beam * 1.00
 
         # ---- Gravitational wave ripples (during inspiral) ----
         if show_gw == 1 and gw_amp > 0.002:
@@ -711,6 +764,54 @@ def render_effects(cx: ti.f32, cy: ti.f32, sim_t: ti.f32,
                 pixels[i, j][0] += ring2 * 1.00
                 pixels[i, j][1] += ring2 * 0.65
                 pixels[i, j][2] += ring2 * 0.15
+
+        # ---- Black Hole Remnant ----
+        if remnant_active == 1 and is_black_hole == 1:
+            if dist < EH_RADIUS:
+                # Swallowed space (event horizon)
+                pixels[i, j] = ti.Vector([0.001, 0.001, 0.003])
+            elif dist < EH_RADIUS * 1.6:
+                # Einstein Ring / gravitational lensing accretion boundary
+                f = (dist - EH_RADIUS) / (EH_RADIUS * 0.6)
+                lensing = ti.exp(-f * f * 2.5) * 1.35 * (0.35 + 0.65 * shock_a)
+                pixels[i, j][0] += lensing * 1.0
+                pixels[i, j][1] += lensing * 0.55
+                pixels[i, j][2] += lensing * 0.15
+
+        # ---- Magnetar Remnant (rotating pulsar beams and dipole field loops) ----
+        if remnant_active == 1 and is_black_hole == 0:
+            # Rotate coordinates to align with magnetic axis (pulsar_angle)
+            ca = ti.cos(-pulsar_angle)
+            sa = ti.sin(-pulsar_angle)
+            rx = ddx * ca - ddy * sa
+            ry = ddx * sa + ddy * ca
+            r_p = ti.sqrt(rx * rx + ry * ry + 1e-12)
+            theta_p = ti.atan2(ry, rx)
+
+            # 1. Narrow Bipolar searchlight beams (along x-axis in rotated frame)
+            diff1 = ti.abs(theta_p)
+            diff2 = ti.abs(theta_p - PI)
+            diff3 = ti.abs(theta_p + PI)
+            min_diff = ti.min(ti.min(diff1, diff2), diff3)
+            
+            if min_diff < 0.06 and r_p < 0.45:
+                beam_factor = ti.exp(-min_diff * min_diff / 0.0006) * (1.0 - r_p / 0.45)
+                # Rapidly spinning light searchlight
+                beam_glow = beam_factor * 0.85 * (0.8 + 0.2 * ti.sin(sim_t * 24.0)) * (0.4 + 0.6 * shock_a)
+                pixels[i, j][0] += beam_glow * 0.65
+                pixels[i, j][1] += beam_glow * 0.82
+                pixels[i, j][2] += beam_glow * 1.00
+
+            # 2. Poloidal dipole field loops (r_p = L * sin^2(theta_p))
+            sin_sq = ti.sin(theta_p)
+            sin_sq = sin_sq * sin_sq
+            for L in ti.static([0.08, 0.16, 0.26]):
+                diff_l = ti.abs(r_p - L * sin_sq)
+                if diff_l < 0.0035 * (1.0 + r_p * 4.0):
+                    loop_glow = 0.25 * ti.exp(-diff_l / 0.002) * (1.0 - r_p / 0.38) * (0.4 + 0.6 * shock_a)
+                    pixels[i, j][0] += loop_glow * 0.22
+                    pixels[i, j][1] += loop_glow * 0.58
+                    pixels[i, j][2] += loop_glow * 1.00
 
         # ---- Tone mapping ----
         for c in ti.static(range(3)):
@@ -798,6 +899,12 @@ def main():
     m_total     = m1 + m2
     omega       = 0.0       # Current orbital angular velocity
 
+    # Remnant & TOV Limit state
+    is_black_hole  = 0     # 1 if total mass > TOV limit, collapses to BH
+    pulsar_angle   = 0.0   # Current spin angle of pulsar beams
+    grb_a          = 0.0   # GRB collimated beam intensity
+    remnant_active = 0     # Whether the central remnant is active
+
     # Merger state
     merge_x, merge_y = 0.5, 0.5
     shock_r   = 0.0
@@ -818,7 +925,7 @@ def main():
     n_particles = DEFAULT_N
 
     # Color mode
-    color_modes = ["Temperature", "Velocity", "Age", "Field Strength"]
+    color_modes = ["Temperature", "Velocity", "Age", "Field Strength", "Element Synthesis"]
     color_mode  = 0
 
     # ---- Sliders ----
@@ -856,6 +963,7 @@ def main():
         nonlocal phase, sim_time, separation, theta, m1, m2, m_total, omega
         nonlocal shock_r, shock_a, flash_a, flash_tmr, merge_x, merge_y
         nonlocal n_particles, s1x, s1y, s2x, s2y, s1vx, s1vy, s2vx, s2vy
+        nonlocal is_black_hole, pulsar_angle, grb_a, remnant_active
 
         phase      = 0
         sim_time   = 0.0
@@ -870,6 +978,10 @@ def main():
         flash_tmr  = 0.0
         merge_x    = 0.5
         merge_y    = 0.5
+        is_black_hole  = 0
+        pulsar_angle   = 0.0
+        grb_a          = 0.0
+        remnant_active = 0
         n_particles = int(sl_particles.value * 1000)
         n_particles = min(n_particles, MAX_P)
 
@@ -962,75 +1074,105 @@ def main():
         if not paused:
             sim_time += dt
 
-            if phase == 0:
-                # ======= INSPIRAL =======
-                # Peters formula orbital decay: da/dt = -C / a^3
-                separation -= GW_DECAY_COEFF * g_mult / (separation**3 + 1e-18) * time_spd
-                separation = max(separation, 0.001)
+            # Substepping loop (5 steps per frame) for fast, stable orbits
+            substeps = 5
+            sub_dt = dt / substeps
 
-                # Kepler's third law: omega^2 = G * M_total / a^3
-                omega = math.sqrt(G * m_total * g_mult / (separation**3 + 1e-18))
-                theta += omega * dt
+            for _ in range(substeps):
+                if phase == 0:
+                    # ======= INSPIRAL =======
+                    # Peters formula orbital decay: da/dt = -C / a^3
+                    # We add a small extra chirp factor near contact for faster acceleration
+                    chirp_acc = 1.0 + max(0.0, (INIT_SEPARATION - separation) / INIT_SEPARATION) * 1.5
+                    separation -= GW_DECAY_COEFF * g_mult * chirp_acc / (separation**3 + 1e-18) * time_spd / substeps
+                    separation = max(separation, 0.001)
 
-                s1x, s1y, s2x, s2y, s1vx, s1vy, s2vx, s2vy, _ = \
-                    star_state(separation, theta, m1, m2)
+                    # Kepler's third law: omega^2 = G * M_total / a^3
+                    omega = math.sqrt(G * m_total * g_mult / (separation**3 + 1e-18))
+                    theta += omega * sub_dt
 
-                step_binary(n_particles, s1x, s1y, s2x, s2y, m1, m2,
-                            dt, damp_val, g_mult, mx, my, mouse_active)
+                    s1x, s1y, s2x, s2y, s1vx, s1vy, s2vx, s2vy, _ = \
+                        star_state(separation, theta, m1, m2)
 
-                # Check merger trigger
-                if separation < MERGE_DISTANCE:
-                    phase   = 1
-                    merge_x = (s1x * m2 + s2x * m1) / m_total  # Center of mass
-                    merge_y = (s1y * m2 + s2y * m1) / m_total
-                    flash_a   = 1.0
-                    flash_tmr = 0.0
-                    shock_r   = 0.0
-                    shock_a   = 0.85
-                    trigger_explosion(n_particles, merge_x, merge_y,
-                                      EXPLODE_SPEED * expl_mult, JET_FRACTION)
-                    print()
-                    print("  >>> MERGER! Kilonova initiated!")
-                    print(f"      Collision at ({merge_x:.3f}, {merge_y:.3f})")
-                    print(f"      Total mass: {m_total:.2f} sim units")
-                    print()
+                    step_binary(n_particles, s1x, s1y, s2x, s2y, m1, m2,
+                                sub_dt, damp_val, g_mult, mx, my, mouse_active)
 
-            elif phase == 1:
-                # ======= COLLISION FLASH =======
-                flash_tmr += dt
-                flash_a = max(0.0, 1.0 - flash_tmr * 45.0)
+                    # Check merger trigger
+                    if separation < MERGE_DISTANCE:
+                        phase   = 1
+                        merge_x = (s1x * m2 + s2x * m1) / m_total  # Center of mass
+                        merge_y = (s1y * m2 + s2y * m1) / m_total
+                        flash_a   = 1.0
+                        flash_tmr = 0.0
+                        shock_r   = 0.0
+                        shock_a   = 0.85
+                        grb_a     = 1.0  # Launch Gamma-Ray Burst vertical beam
+                        
+                        # Check TOV Mass Limit: collapses to BH if mass ratio > limit
+                        is_black_hole = 1 if (m_total > TOV_LIMIT) else 0
+                        remnant_active = 1
 
-                shock_r += SHOCK_SPEED * time_spd
-                shock_a = max(0.0, 0.85 - shock_r * 1.3)
+                        trigger_explosion(n_particles, merge_x, merge_y,
+                                          EXPLODE_SPEED * expl_mult, JET_FRACTION)
+                        print()
+                        print("  >>> MERGER! Kilonova initiated!")
+                        print(f"      Collision at ({merge_x:.3f}, {merge_y:.3f})")
+                        print(f"      Total mass: {m_total:.2f} sim units (TOV Limit: {TOV_LIMIT:.2f})")
+                        if is_black_hole == 1:
+                            print("  >>> MASS EXCEEDS TOV LIMIT! Collapsing into a BLACK HOLE!")
+                        else:
+                            print("  >>> MASS BELOW TOV LIMIT! Settling into a rapidly spinning MAGNETAR!")
+                        print()
+                        break # Break out of substeps to enter Phase 1 immediately
 
-                step_merged(n_particles, merge_x, merge_y, m_total,
-                            dt, damp_val, g_mult, mx, my, mouse_active)
+                elif phase == 1:
+                    # ======= COLLISION FLASH =======
+                    flash_tmr += sub_dt
+                    flash_a = max(0.0, 1.0 - flash_tmr * 45.0)
+                    # GRB decays rapidly
+                    grb_a = max(0.0, grb_a * math.exp(-sub_dt * 15.0))
 
-                if flash_a <= 0.005:
-                    phase = 2
-                    print("  >>> Kilonova expansion: r-process nucleosynthesis active")
-                    print("      (Heavy elements — gold, platinum — being forged)")
+                    shock_r += SHOCK_SPEED * time_spd / substeps
+                    shock_a = max(0.0, 0.85 - shock_r * 1.3)
 
-            elif phase == 2:
-                # ======= KILONOVA EXPANSION =======
-                shock_r += SHOCK_SPEED * time_spd
-                shock_a = max(0.0, 0.65 - shock_r * 0.9)
+                    step_merged(n_particles, merge_x, merge_y, m_total,
+                                sub_dt, damp_val, g_mult, mx, my, mouse_active, is_black_hole)
 
-                step_merged(n_particles, merge_x, merge_y, m_total,
-                            dt, damp_val, g_mult, mx, my, mouse_active)
+                    if flash_a <= 0.005:
+                        phase = 2
+                        print("  >>> Kilonova expansion: r-process nucleosynthesis active")
+                        print("      (Heavy elements — gold, platinum — being forged)")
 
-                if shock_r > 0.85:
-                    phase = 3
-                    print("  >>> Remnant settling (hypermassive NS or black hole)")
+                elif phase == 2:
+                    # ======= KILONOVA EXPANSION =======
+                    # GRB decays slightly slower
+                    grb_a = max(0.0, grb_a * math.exp(-sub_dt * 8.0))
+                    
+                    shock_r += SHOCK_SPEED * time_spd / substeps
+                    shock_a = max(0.0, 0.65 - shock_r * 0.9)
 
-            elif phase == 3:
-                # ======= AFTERMATH =======
-                if shock_a > 0.005:
-                    shock_r += SHOCK_SPEED * time_spd * 0.4
-                    shock_a *= 0.994
+                    step_merged(n_particles, merge_x, merge_y, m_total,
+                                sub_dt, damp_val, g_mult, mx, my, mouse_active, is_black_hole)
 
-                step_merged(n_particles, merge_x, merge_y, m_total,
-                            dt, damp_val, g_mult, mx, my, mouse_active)
+                    if shock_r > 0.85:
+                        phase = 3
+                        print("  >>> Remnant settling (hypermassive NS or black hole)")
+
+                elif phase == 3:
+                    # ======= AFTERMATH =======
+                    grb_a = max(0.0, grb_a * math.exp(-sub_dt * 4.0))
+                    if shock_a > 0.005:
+                        shock_r += SHOCK_SPEED * time_spd * 0.4 / substeps
+                        shock_a *= 0.994
+
+                    step_merged(n_particles, merge_x, merge_y, m_total,
+                                sub_dt, damp_val, g_mult, mx, my, mouse_active, is_black_hole)
+
+        # Update pulsar rotation if magnetar is active and simulation is running
+        if remnant_active == 1 and is_black_hole == 0 and not paused:
+            pulsar_angle += 85.0 * dt
+            if pulsar_angle > 2.0 * PI:
+                pulsar_angle -= 2.0 * PI
 
         # ---- RENDERING ----
 
@@ -1052,16 +1194,19 @@ def main():
         elif phase == 1:
             # Bright merger flash remnant
             render_star_glow(merge_x, merge_y, STAR_GLOW_R + 12,
-                             0.90, 0.95, 1.0, S_BRIGHT * 1.6)
-        elif phase == 2:
-            # Fading kilonova core
-            rb = S_BRIGHT * max(0.4, 1.0 - shock_r * 1.2)
-            render_star_glow(merge_x, merge_y, STAR_GLOW_R,
-                             0.70, 0.75, 1.0, rb)
+                             0.95, 0.97, 1.0, S_BRIGHT * 1.8)
         else:
-            # Black hole remnant (dim, compact)
-            render_star_glow(merge_x, merge_y, 14,
-                             0.18, 0.14, 0.35, S_BRIGHT * 0.28)
+            # Phase 2 & 3: Remnant core settling
+            if is_black_hole == 1:
+                # Black Hole: render accretion disk glow (event horizon itself is drawn in effects)
+                rb = S_BRIGHT * 0.65 * max(0.15, 1.0 - shock_r * 0.9)
+                render_star_glow(merge_x, merge_y, STAR_GLOW_R + 8,
+                                 1.0, 0.52, 0.12, rb)
+            else:
+                # Magnetar: render hot blue-white core
+                rb = S_BRIGHT * 1.40 * max(0.40, 1.0 - shock_r * 0.9)
+                render_star_glow(merge_x, merge_y, STAR_GLOW_R - 4,
+                                 0.50, 0.75, 1.0, rb)
 
         # 4) Screen-space effects (GW ripples, shockwave, flash, tone map)
         do_gw    = 1 if phase == 0 else 0
@@ -1080,7 +1225,8 @@ def main():
                        shock_r, shock_a,
                        gw_a, gw_wl,
                        do_gw, do_shock,
-                       flash_a if phase == 1 else 0.0)
+                       flash_a if phase == 1 else 0.0,
+                       is_black_hole, pulsar_angle, remnant_active, grb_a)
 
         # 5) Set image from pixel buffer
         gui.set_image(pixels)
@@ -1100,17 +1246,39 @@ def main():
         gui.text("[click / C]",
                  pos=(0.028, 0.48), font_size=10, color=0x445566)
 
+        # Element Synthesis Legend (Only shows when Element Synthesis mode is selected)
+        if color_mode == 4:
+            gui.text("Synthesis Zone:", pos=(0.028, 0.44), font_size=11, color=0x7799CC)
+            # Platinum (Silver/Blue-white)
+            gui.rect((0.028, 0.41), (0.040, 0.425), color=0xDCEEFA)
+            gui.text("Platinum (Pt)", pos=(0.048, 0.41), font_size=10, color=0xCCDDF8)
+            # Gold (Au)
+            gui.rect((0.028, 0.38), (0.040, 0.395), color=0xFFC70D)
+            gui.text("Gold (Au)", pos=(0.048, 0.38), font_size=10, color=0xFFDD44)
+            # Uranium (U)
+            gui.rect((0.028, 0.35), (0.040, 0.365), color=0x38F266)
+            gui.text("Uranium (U)", pos=(0.048, 0.35), font_size=10, color=0x58FF88)
+            # Iron / ISM
+            gui.rect((0.028, 0.32), (0.040, 0.335), color=0x1A73BF)
+            gui.text("ISM / Iron (Fe)", pos=(0.048, 0.32), font_size=10, color=0x3F9FEF)
+
         # Phase indicator
         pnames  = ["INSPIRAL", "COLLISION!", "KILONOVA", "AFTERMATH"]
         pcolors = [0x4488FF, 0xFFFF55, 0xFF8844, 0x777788]
         gui.text(pnames[phase], pos=(0.42, 0.965),
                  font_size=18, color=pcolors[phase])
+                 
+        if phase >= 2:
+            rname = "BLACK HOLE remnant" if is_black_hole == 1 else "MAGNETAR remnant"
+            rcolor = 0xFF5555 if is_black_hole == 1 else 0x55FFFF
+            gui.text(rname, pos=(0.39, 0.935), font_size=12, color=rcolor)
 
         # Orbital info during inspiral
         if phase == 0:
             gui.text(f"Separation: {separation:.4f}",
                      pos=(0.38, 0.030), font_size=12, color=0x5577AA)
-            freq_hz = omega / (2.0 * PI)
+            # Physical scaling for the frequency chirp (from ~30 Hz to 1000+ Hz)
+            freq_hz = omega * 480.0 / (2.0 * PI)
             gui.text(f"GW Freq: {freq_hz:.1f} Hz (chirp)",
                      pos=(0.38, 0.010), font_size=12, color=0x5577AA)
 
